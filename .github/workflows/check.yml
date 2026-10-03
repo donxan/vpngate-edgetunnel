@@ -37,6 +37,22 @@ jobs:
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
 
+      - name: Sync nodes to Cloudflare EdgeTunnel KV
+        env:
+          CF_AUTH_KEY: ${{ secrets.CF_AUTH_KEY }}
+          CF_AUTH_EMAIL: ${{ secrets.CF_AUTH_EMAIL }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_ID: ${{ secrets.CF_KV_ID }}
+        run: |
+          if [ -n "$CF_AUTH_KEY" ]; then
+            echo "Syncing nodes.txt to Cloudflare KV (ADD.txt)..."
+            curl -sS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_ID/values/ADD.txt" \
+              -H "X-Auth-Key: $CF_AUTH_KEY" \
+              -H "X-Auth-Email: $CF_AUTH_EMAIL" \
+              --data-binary "@public/nodes.txt"
+            echo "KV sync completed."
+          fi
+
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' \

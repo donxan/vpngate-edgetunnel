@@ -137,7 +137,7 @@ def parse_csv(text):
     header = lines[header_idx].lstrip("#").split(",")
     data_lines = lines[header_idx + 1:]
     idx = {}
-    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
+    for col in ("hostname", "ip", "speed", "ping", "countrylong", "countryshort", "openvpn_configdata_base64"):
         for i, h in enumerate(header):
             if h.strip().lstrip("*").lower() == col:
                 idx[col] = i
@@ -147,7 +147,14 @@ def parse_csv(text):
             if "base64" in h.lower():
                 idx["openvpn_configdata_base64"] = i
                 break
-    pos = {"hostname": idx.get("hostname", 0), "ip": idx.get("ip", 1), "countrylong": idx.get("countrylong", 5), "countryshort": idx.get("countryshort", 6), "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
+    pos = {
+        "hostname": idx.get("hostname", 0),
+        "ip": idx.get("ip", 1),
+        "speed": idx.get("speed", -1),
+        "countrylong": idx.get("countrylong", 5),
+        "countryshort": idx.get("countryshort", 6),
+        "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)
+    }
 
     rows = []
     for ln in data_lines:
@@ -156,7 +163,20 @@ def parse_csv(text):
         host = fields[pos["hostname"]].strip()
         ip = fields[pos["ip"]].strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": fields[pos["countrylong"]].strip(), "country_short": fields[pos["countryshort"]].strip(), "config_b64": fields[pos["openvpn_configdata_base64"]].strip()})
+        speed = 0
+        if pos["speed"] != -1 and len(fields) > pos["speed"]:
+            try:
+                speed = int(fields[pos["speed"]].strip() or 0)
+            except Exception:
+                speed = 0
+        rows.append({
+            "host": host,
+            "ip": ip,
+            "speed": speed,
+            "country_long": fields[pos["countrylong"]].strip(),
+            "country_short": fields[pos["countryshort"]].strip(),
+            "config_b64": fields[pos["openvpn_configdata_base64"]].strip()
+        })
     return rows
 
 def parse_mirror_json(data):
@@ -198,7 +218,7 @@ def to_sstp_nodes(rows):
         host = r["host"]
         if not host.endswith(".opengw.net"):
             host = f"{host}.opengw.net"
-        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
+        nodes.append({"host": host, "port": port, "ip": r["ip"], "speed": r.get("speed", 0), "country": r["country_long"], "country_code": r["country_short"]})
     return nodes
 
 def dedupe(nodes):
@@ -306,27 +326,66 @@ EDGE_HOSTS = [
 NODES_URL = os.environ.get("NODES_URL", "https://donxan.github.io/vpngate-edgetunnel/nodes.txt")
 
 def build_nodes_text(data):
-    """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
+    """生成混合双模式节点列表: 前置极速直连节点 + 后置精选住宅/机房节点"""
     countries = data["countries"]
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
     lines = []
+
+    # =========================================================================
+    # 分组 1: 🚀 极速直连优选节点 (直出 Cloudflare 全球极速骨干网，看 4K 秒开，日常主力推荐)
+    # =========================================================================
+    fast_direct_nodes = [
+        "gate-edge.988228.xyz:443#🚀极速直连-官方主入口01",
+        "saas.072159.xyz:443#🚀极速直连-Cloudflare优选02",
+        "cf.777791.xyz:443#🚀极速直连-Cloudflare优选03",
+        "cdn.cnno.de:443#🚀极速直连-香港优质节点04",
+        "auto.dolby.dpdns.org:443#🚀极速直连-亚太高速节点05",
+        "hzytjy.cn:443#🚀极速直连-低延迟优质06",
+        "saas.sin.fan:443#🚀极速直连-新加坡高速07",
+        "104.16.249.4:443#🚀极速直连-电信优选08",
+        "104.17.118.67:443#🚀极速直连-联通优选09",
+        "172.67.70.163:443#🚀极速直连-移动优选10",
+    ]
+    lines.extend(fast_direct_nodes)
+
+    # =========================================================================
+    # 分组 2: 🛡️ 原生家宽住宅 / 机房解锁节点 (链式代理至真实住宅，专用于过风控/解锁)
+    # =========================================================================
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
+        
+        # 优先按带宽降序、延迟升序精选优质节点
+        nodes = sorted(
+            grp["nodes"],
+            key=lambda n: (
+                0 if n.get("residential") == "residential" else 1,
+                -int(n.get("speed") or 0),
+                n.get("latency_ms") is None,
+                n.get("latency_ms") or 0,
+                n.get("host") or ""
+            )
+        )
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
+
+        # 每个国家只精选前 5 个最高带宽的住宅家宽
+        for i, n in enumerate(res_nodes[:5], 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
+            sp_mbps = (n.get("speed") or 0) / 1000000.0
+            sp_str = f"-[{sp_mbps:.1f}M]" if sp_mbps > 0 else ""
+            lines.append(f"{entry}#🛡️{zh}-原生住宅-{i:02d}{sp_str}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+
+        # 每个国家精选前 2 个机房节点
+        for i, n in enumerate(dc_nodes[:2], 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#🏢{zh}-机房落地-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+
     return "\n".join(lines) + "\n"
 
 def write_outputs(data):
